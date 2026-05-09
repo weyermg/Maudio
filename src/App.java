@@ -1,5 +1,6 @@
 import java.io.BufferedReader;
 import java.io.EOFException;
+import java.io.FileReader;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
@@ -10,6 +11,8 @@ import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.Base64;
+
+import javax.net.ssl.SSLSocketFactory;
 
 /**
  * @formatter:off
@@ -22,158 +25,130 @@ import java.util.Base64;
  */
 public class App {
     public static void main(String[] args) {
-        ServerSocket server;
         try {
-            server = new ServerSocket(8080);
-            System.out.println("Listening on 8080");
-            Socket socket = server.accept();
-
-            InputStream in = socket.getInputStream();
-            OutputStream out = socket.getOutputStream();
-
-            BufferedReader reader = new BufferedReader(new InputStreamReader(in));
-
-            String line;
-            String key = null;
-
-            while (!(line = reader.readLine()).isEmpty()) { // 1.
-                System.out.println(line);
-                if (line.startsWith("sec-websocket-key:")) {
-                    key = line.substring(18).trim();
-                }
+            ServerConfig config = parseConfig("settings.yaml");
+            System.out.println("Server URL: " + config.serverUrl);
+            
+            String path = config.serverUrl;
+            if (path.endsWith("/")) {
+                path = path.substring(0, path.length() - 1);
             }
+            String url = path + "/rest/getArtists?u=" + config.username + "&p=" + config.password + "&v=1.16.1&c=maudio&f=json";
+            
+            System.out.println("Fetching artists...");
+            String response = sendGetRequest(url);
+            System.out.println("Response:\n" + response);
 
-            String accept = getAccept(key);
-            System.out.println(accept);
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+    }
 
-            String reply = "HTTP/1.1 101 Switching Protocols\r\n" + // 1.
-                    "Upgrade: websocket\r\n" +
-                    "Connection: Upgrade\r\n" +
-                    "Sec-WebSocket-Accept: " + accept + "\r\n\r\n";
+    public static String sendGetRequest(String urlStr) throws Exception {
+        java.net.URL url = new java.net.URL(urlStr);
+        String host = url.getHost();
+        boolean isHttps = "https".equalsIgnoreCase(url.getProtocol());
+        int port = url.getPort() != -1 ? url.getPort() : (url.getDefaultPort() != -1 ? url.getDefaultPort() : (isHttps ? 443 : 80));
+        String path = url.getFile();
+        if (path.isEmpty()) path = "/";
 
-            out.write(reply.getBytes(StandardCharsets.UTF_8));
+        Socket socket = isHttps ? SSLSocketFactory.getDefault().createSocket(host, port) : new Socket(host, port);
+        try (Socket s = socket) {
+            OutputStream out = s.getOutputStream();
+            String request = "GET " + path + " HTTP/1.1\r\n" +
+                             "Host: " + host + "\r\n" +
+                             "Connection: close\r\n\r\n";
+            out.write(request.getBytes(StandardCharsets.UTF_8));
             out.flush();
 
-            String message = readMessage(in);
-
-            System.out.println("Received from Client: " + message);
-
-            sendMessage(out, generateNoise());
-            System.out.println("Response sent");
-
-        } catch (IOException e) {
-            e.printStackTrace();
-        }
-
-    }
-
-    private static void readAll(InputStream in, byte[] buf) throws IOException {
-        int offset = 0;
-
-        while (offset < buf.length) {
-            int received = in.read(buf, offset, buf.length - offset);
-
-            if (received == -1) {
-                throw new EOFException("Connection closed");
-            }
-
-            offset += received;
+            return readHttpResponse(s.getInputStream());
         }
     }
 
-    private static String readMessage(InputStream in) throws IOException {
-        // 2.5.2
-        int b1 = in.read(); // FIN + opcode
-        int b2 = in.read(); // MASK + payload length indicator
+    public static String sendPostRequest(String urlStr, String payload) throws Exception {
+        java.net.URL url = new java.net.URL(urlStr);
+        String host = url.getHost();
+        boolean isHttps = "https".equalsIgnoreCase(url.getProtocol());
+        int port = url.getPort() != -1 ? url.getPort() : (url.getDefaultPort() != -1 ? url.getDefaultPort() : (isHttps ? 443 : 80));
+        String path = url.getFile();
+        if (path.isEmpty()) path = "/";
 
-        int payloadIndicator = b2 & 0b0111111;
-        long payloadLength;
+        byte[] body = payload.getBytes(StandardCharsets.UTF_8);
 
-        if (payloadIndicator <= 125) {
-            payloadLength = payloadIndicator;
-        } else if (payloadIndicator == 126) {
-            int b3 = in.read();
-            int b4 = in.read();
+        Socket socket = isHttps ? SSLSocketFactory.getDefault().createSocket(host, port) : new Socket(host, port);
+        try (Socket s = socket) {
+            OutputStream out = s.getOutputStream();
+            String request = "POST " + path + " HTTP/1.1\r\n" +
+                             "Host: " + host + "\r\n" +
+                             "Content-Length: " + body.length + "\r\n" +
+                             "Content-Type: application/x-www-form-urlencoded\r\n" +
+                             "Connection: close\r\n\r\n";
+            out.write(request.getBytes(StandardCharsets.UTF_8));
+            out.write(body);
+            out.flush();
 
-            payloadLength = ((b3 & 0xFF) << 8) | (b4 & 0xFF);
-            // We're doing & 0xFF because our bytes are being read into an integer type.
-            // Java does this in an signed manner, but we don't want that so we use 0xFF to
-            // turn e.g. FF FF FF FE into 00 00 00 FE
-        } else {
-            payloadLength = 0;
+            return readHttpResponse(s.getInputStream());
+        }
+    }
 
-            for (int i = 0; i < 8; i++) {
-                payloadLength = (payloadLength << 8) | (in.read() & 0xFF);
+    private static String readHttpResponse(InputStream in) throws IOException {
+        BufferedReader reader = new BufferedReader(new InputStreamReader(in, StandardCharsets.UTF_8));
+        StringBuilder response = new StringBuilder();
+        String line;
+        boolean inBody = false;
+        while ((line = reader.readLine()) != null) {
+            if (!inBody) {
+                if (line.isEmpty()) {
+                    inBody = true;
+                }
+            } else {
+                response.append(line).append("\n");
             }
         }
-
-        byte[] mask = new byte[4]; // We ignore MASK bit because this message was Client -> Server so MASK == 1 is
-                                   // required
-
-        readAll(in, mask);
-
-        byte[] payload = new byte[(int) payloadLength];
-        readAll(in, payload);
-
-        for (int i = 0; i < payload.length; i++) { // Mask is applied to every four byte frame
-            payload[i] ^= mask[i % 4];
-        }
-
-        return new String(payload, StandardCharsets.UTF_8);
+        return response.toString();
     }
 
-    private static void sendMessage(OutputStream out, byte[] msg) throws IOException {
-        out.write(0b10000001);
+    public static class ServerConfig {
+        public String serverUrl;
+        public String username;
+        public String password;
+    }
 
-        if (msg.length <= 125) {
-            out.write(msg.length);
-        } else if (msg.length <= 65535) {
-            out.write(126);
-            out.write((msg.length >> 8) & 0xFF);
-            out.write(msg.length & 0xFF);
-        } else {
-            out.write(127);
-            long len = msg.length;
-
-            for (int i = 7; i >= 0; i--) {
-                out.write((int) ((len >> (8 * i)) & 0xFF));
+    public static ServerConfig parseConfig(String filePath) throws IOException {
+        ServerConfig config = new ServerConfig();
+        try (BufferedReader br = new BufferedReader(new FileReader(filePath))) {
+            String line;
+            while ((line = br.readLine()) != null) {
+                line = line.trim();
+                if (line.isEmpty() || line.startsWith("#")) continue;
+                
+                int colonIndex = line.indexOf(':');
+                if (colonIndex > 0) {
+                    String key = line.substring(0, colonIndex).trim();
+                    String value = line.substring(colonIndex + 1).trim();
+                    
+                    if ((value.startsWith("\"") && value.endsWith("\"")) || (value.startsWith("'") && value.endsWith("'"))) {
+                        value = value.substring(1, value.length() - 1);
+                    }
+                    
+                    switch (key) {
+                        case "server_url":
+                        case "serverUrl":
+                        case "url":
+                            config.serverUrl = value;
+                            break;
+                        case "username":
+                        case "user":
+                            config.username = value;
+                            break;
+                        case "password":
+                        case "pass":
+                            config.password = value;
+                            break;
+                    }
+                }
             }
         }
-
-        out.write(msg);
-        out.flush();
-    }
-
-    private static void sendMessage(OutputStream out, String message) throws IOException {
-        byte[] msg = message.getBytes(StandardCharsets.UTF_8);
-        sendMessage(out, msg);
-    }
-
-    private static String getAccept(String key) { // 1.
-        String plusRFC_ID = key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
-
-        MessageDigest md;
-        try {
-            md = MessageDigest.getInstance("SHA-1");
-        } catch (NoSuchAlgorithmException e) {
-            e.printStackTrace();
-            return null;
-        }
-
-        byte[] hash = md.digest(plusRFC_ID.getBytes(StandardCharsets.UTF_8));
-
-        return Base64.getEncoder().encodeToString(hash);
-    }
-
-    private static byte[] generateNoise() {
-        byte[] noise = new byte[128 * 1024];
-        double t = 0;
-        double dt = 2 * Math.PI * 1 / 48000;
-        for (int i = 0; i < noise.length; i++) {
-            noise[i] = (byte) Math.floor(Math.sin(t) * 127);
-            t = (t + dt) % (Math.PI * 2);
-        }
-
-        return noise;
+        return config;
     }
 }
